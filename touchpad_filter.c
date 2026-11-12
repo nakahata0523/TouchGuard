@@ -20,16 +20,14 @@
 #define MAX_BUFFER_EVENTS 1048576U
 struct buffer { struct input_event *v; size_t n, cap; };
 struct filter {
-    int out, click, slot, slot_min, slot_count, fingers;
+    int out, slot, slot_min, slot_count, fingers;
     unsigned char *active;
     double x, y, xres, yres, start_x, start_y, start, last_move;
     double threshold, min_move2, click_window, tap_max, tap_slop2, step2;
-    double max_distance2;
+    double max_distance2, drag_window, continuation_until;
     int session, accepted, max_fingers, has_move, quiet;
     unsigned int buttons;
     int physical_used;
-    double last_tap, drag_window;
-    int tap_armed, dragging;
     struct buffer pending;
 };
 static volatile sig_atomic_t stopping;
@@ -62,126 +60,82 @@ static double distance2(struct filter *f, double x, double y) {
 static void emit(int fd, struct buffer *b) {
     if (b->n) write_events(fd, b->v, b->n);
 }
-static void click_mouse(struct filter *f) {
-    struct input_event events[2] = {
-        {.type=EV_KEY, .code=BTN_LEFT, .value=1},
-        {.type=EV_SYN, .code=SYN_REPORT}
-    };
-    write_events(f->click, events, 2);
-    struct timespec delay = {.tv_nsec=20000000};
-    while (nanosleep(&delay, &delay) < 0 && errno == EINTR && !stopping) {}
-    events[0].value = 0;
-    write_events(f->click, events, 2);
-    if (!f->quiet) puts("TAP CLICK ALLOW");
-}
-static void drag_button(struct filter *f, int down) {
-    int was_down = f->dragging || (f->buttons & 1U);
-    f->dragging = down;
-    int is_down = f->dragging || (f->buttons & 1U);
-    if (was_down != is_down) {
-        struct input_event events[2] = {
-            {.type=EV_KEY, .code=BTN_LEFT, .value=is_down},
-            {.type=EV_SYN, .code=SYN_REPORT}
-        };
-        write_events(f->click, events, 2);
-    }
-}
-/* Physical buttons are routed separately from the touchpad frame. */
+/* Keep native button events and contact information together, so libinput can
+ * apply clickfinger, button areas, tapping and dragging itself. Only an idle
+ * single-finger contact is withheld while its intent is unknown. */
 static void process_frame(struct filter *f, struct buffer *frame, double now) {
-    int had_button = f->buttons != 0;
-    size_t kept = 0;
-    for (size_t i = 0; i < frame->n; i++) {
-        struct input_event ev = frame->v[i];
-        if (ev.type == EV_KEY &&
-            (ev.code == BTN_LEFT || ev.code == BTN_RIGHT || ev.code == BTN_MIDDLE)) {
-            unsigned int bit = 1U << (ev.code - BTN_LEFT);
-            had_button = 1;
-            if (ev.value == 1) f->buttons |= bit;
-            else if (ev.value == 0) f->buttons &= ~bit;
-            struct input_event button_frame[2] = {
-                ev, {.type=EV_SYN, .code=SYN_REPORT}
-            };
-            if (!(ev.code == BTN_LEFT && f->dragging))
-                write_events(f->click, button_frame, 2);
-        } else frame->v[kept++] = ev;
-    }
-    frame->n = kept;
-    if (had_button) { f->physical_used = 1; f->tap_armed = 0; }
-    int previous_fingers = f->fingers, updated = 0;
-    double previous_x = f->x, previous_y = f->y;
+    int previous_fingers=f->fingers, had_button=f->buttons!=0, updated=0;
+    double previous_x=f->x, previous_y=f->y;
     for (size_t i=0; i<frame->n; i++) {
-        struct input_event *e = &frame->v[i];
-        if (e->type != EV_ABS) continue;
-        switch (e->code) {
-        case ABS_MT_SLOT: f->slot = e->value; break;
+        struct input_event *ev=&frame->v[i];
+        if (ev->type==EV_KEY &&
+            (ev->code==BTN_LEFT || ev->code==BTN_RIGHT || ev->code==BTN_MIDDLE)) {
+            unsigned int bit=1U << (ev->code-BTN_LEFT);
+            had_button=1;
+            if (ev->value==1) f->buttons|=bit;
+            else if (ev->value==0) f->buttons&=~bit;
+        }
+        if (ev->type!=EV_ABS) continue;
+        switch (ev->code) {
+        case ABS_MT_SLOT: f->slot=ev->value; break;
         case ABS_MT_TRACKING_ID: {
-            int64_t index = (int64_t)f->slot - f->slot_min;
-            if (index < 0 || index >= f->slot_count) {
-                fprintf(stderr, "Invalid multitouch slot\n"); exit(1);
+            int64_t index=(int64_t)f->slot-f->slot_min;
+            if (index<0 || index>=f->slot_count) {
+                fprintf(stderr,"Invalid multitouch slot\n"); exit(1);
             }
-            int active = e->value >= 0;
-            f->fingers += active - f->active[index];
-            f->active[index] = (unsigned char)active;
+            int active=ev->value>=0;
+            f->fingers+=active-f->active[index];
+            f->active[index]=(unsigned char)active;
             break;
         }
-        case ABS_X: f->x=e->value; updated=1; break;
-        case ABS_Y: f->y=e->value; updated=1; break;
+        case ABS_X: f->x=ev->value; updated=1; break;
+        case ABS_Y: f->y=ev->value; updated=1; break;
         }
     }
-    int started = !previous_fingers && f->fingers;
-    int ended = previous_fingers && !f->fingers;
+    int started=!previous_fingers && f->fingers;
+    int ended=previous_fingers && !f->fingers;
     if (started) {
         f->session=1; f->start=now; f->start_x=f->x; f->start_y=f->y;
-        f->max_fingers=f->fingers; f->max_distance2=0; f->accepted=0;
-        f->pending.n=0; f->physical_used=had_button;
-        if (f->tap_armed && !had_button && f->fingers == 1 &&
-            now >= f->last_tap && now-f->last_tap <= f->drag_window) {
-            drag_button(f, 1);
-            f->accepted=1;
-            if (!f->quiet) puts("TAP DRAG START");
-        }
-        f->tap_armed=0;
-    } else if (f->session) {
-        if (f->fingers > f->max_fingers) f->max_fingers=f->fingers;
-        if (previous_fingers > f->max_fingers) f->max_fingers=previous_fingers;
-        if (f->max_fingers == 1) {
-            double d=distance2(f, f->x-f->start_x, f->y-f->start_y);
-            if (d > f->max_distance2) f->max_distance2=d;
-        }
+        f->max_fingers=f->fingers; f->max_distance2=0;
+        f->physical_used=had_button; f->pending.n=0;
+        int recent=f->has_move && now>=f->last_move && now-f->last_move<=f->click_window;
+        int continuation=now<=f->continuation_until;
+        f->accepted=recent || continuation;
+        f->continuation_until=0;
     }
-    /* Adding a second finger ends the synthetic hold, allowing gestures. */
-    if (f->dragging && f->fingers > 1) drag_button(f, 0);
-    if (f->session && !f->accepted) {
-        for (size_t i=0; i<frame->n; i++) append(&f->pending, frame->v[i]);
-    } else emit(f->out, frame);
     if (f->session) {
+        if (had_button) f->physical_used=1;
+        if (f->fingers>f->max_fingers) f->max_fingers=f->fingers;
+        if (previous_fingers>f->max_fingers) f->max_fingers=previous_fingers;
+        if (f->max_fingers==1) {
+            double d=distance2(f,f->x-f->start_x,f->y-f->start_y);
+            if (d>f->max_distance2) f->max_distance2=d;
+        }
         double duration=now-f->start;
-        if (!f->accepted && duration >= f->threshold) {
-            int moving=f->max_fingers==1 && f->max_distance2>=f->min_move2;
-            if (moving || f->max_fingers>=2) {
-                f->accepted=1; emit(f->out, &f->pending); f->pending.n=0;
-                if (moving) { f->last_move=now; f->has_move=1; }
-                if (!f->quiet) puts(moving ? "POINTER MOVE ALLOW" : "MULTITOUCH ALLOW");
-            }
-        } else if (f->accepted && f->fingers && previous_fingers==1 &&
-                   f->fingers==1 && updated &&
-                   distance2(f, f->x-previous_x, f->y-previous_y)>=f->step2) {
+        int moving=f->max_fingers==1 && f->max_distance2>=f->min_move2;
+        /* These bypass the single-finger gate without any time threshold. */
+        int bypass=had_button || f->max_fingers>=2;
+        if (!f->accepted && (moving || bypass)) {
+            f->accepted=1;
+            emit(f->out,&f->pending); f->pending.n=0;
+        }
+        if (f->accepted && f->max_fingers==1 && updated &&
+            duration>=f->threshold && moving &&
+            (started || distance2(f,f->x-previous_x,f->y-previous_y)>=f->step2)) {
             f->last_move=now; f->has_move=1;
         }
+        if (f->accepted) emit(f->out,frame);
+        else for (size_t i=0;i<frame->n;i++) append(&f->pending,frame->v[i]);
         if (ended) {
-            int recent=f->has_move && now-f->last_move>=0 && now-f->last_move<=f->click_window;
-            int tap=!f->accepted && f->max_fingers==1 && duration<=f->tap_max &&
-                    f->max_distance2<=f->tap_slop2;
-            if (tap && recent && !f->physical_used && !f->buttons) {
-                click_mouse(f);
-                f->last_tap=now; f->tap_armed=1;
-            }
-            else if (!f->accepted && !f->quiet)
-                printf("TOUCH DROP: %.0f ms, %.2f mm\n", duration*1000, sqrt(f->max_distance2));
-            if (f->dragging) drag_button(f, 0);
-            f->session=0; f->accepted=0; f->max_fingers=0; f->pending.n=0;
+            /* Let the OS handle the continuation of a native tap/drag,
+             * including a multi-finger tap followed by a one-finger drag. */
+            if (f->accepted && !f->physical_used && duration<=f->tap_max &&
+                (f->max_fingers>=2 || f->max_distance2<=f->tap_slop2))
+                f->continuation_until=now+f->drag_window;
+            if (!f->accepted && !f->quiet) puts("IDLE SINGLE-FINGER TOUCH DROP");
+            f->session=0; f->accepted=0; f->pending.n=0;
         }
-    }
+    } else emit(f->out,frame);
     frame->n=0;
 }
 static int check_ioctl(int fd, unsigned long request, unsigned long arg) {
@@ -234,15 +188,6 @@ static int clone_device(int dev, struct input_absinfo *absinfo) {
     check_ioctl(fd,UI_DEV_CREATE,0);
     return fd;
 }
-static int create_mouse(void) {
-    int fd=new_uinput();
-    check_ioctl(fd,UI_SET_EVBIT,EV_KEY); check_ioctl(fd,UI_SET_KEYBIT,BTN_LEFT);
-    check_ioctl(fd,UI_SET_KEYBIT,BTN_RIGHT); check_ioctl(fd,UI_SET_KEYBIT,BTN_MIDDLE);
-    check_ioctl(fd,UI_SET_EVBIT,EV_REL); check_ioctl(fd,UI_SET_RELBIT,REL_X); check_ioctl(fd,UI_SET_RELBIT,REL_Y);
-    struct uinput_setup setup={.id={.bustype=BUS_USB},.name="Touchpad Filter Click Mouse"};
-    check_ioctl(fd,UI_DEV_SETUP,(unsigned long)&setup); check_ioctl(fd,UI_DEV_CREATE,0);
-    return fd;
-}
 static void usage(const char *name) {
     printf("Usage: %s [options] /dev/input/eventN\n"
            "  --threshold-ms N     default 30\n  --min-move-mm N      default 0.3\n"
@@ -286,7 +231,7 @@ int main(int argc, char **argv) {
     struct input_absinfo absinfo[ABS_CNT]={0};
     struct sigaction sa={.sa_handler=stop_handler};
     sigemptyset(&sa.sa_mask); sigaction(SIGINT,&sa,NULL); sigaction(SIGTERM,&sa,NULL);
-    f.out=clone_device(dev,absinfo); f.click=create_mouse();
+    f.out=clone_device(dev,absinfo);
     f.xres=absinfo[ABS_X].resolution; f.yres=absinfo[ABS_Y].resolution;
     if (f.xres<=0 || f.yres<=0) { fprintf(stderr,"Invalid coordinate resolution\n"); return 1; }
     f.slot=absinfo[ABS_MT_SLOT].value; f.slot_min=absinfo[ABS_MT_SLOT].minimum;
@@ -329,8 +274,7 @@ int main(int argc, char **argv) {
             }
         }
     }
-    if (f.dragging) drag_button(&f, 0);
-    ioctl(dev,EVIOCGRAB,0); ioctl(f.out,UI_DEV_DESTROY); ioctl(f.click,UI_DEV_DESTROY);
-    close(f.out); close(f.click); close(dev); free(f.active); free(frame.v); free(f.pending.v);
+    ioctl(dev,EVIOCGRAB,0); ioctl(f.out,UI_DEV_DESTROY);
+    close(f.out); close(dev); free(f.active); free(frame.v); free(f.pending.v);
     return status;
 }
