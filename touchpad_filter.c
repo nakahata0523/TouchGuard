@@ -26,6 +26,10 @@ struct filter {
     double threshold, min_move2, click_window, tap_max, tap_slop2, step2;
     double max_distance2;
     int session, accepted, max_fingers, has_move, quiet;
+    unsigned int buttons;
+    int physical_used;
+    double last_tap, drag_window;
+    int tap_armed, dragging;
     struct buffer pending;
 };
 static volatile sig_atomic_t stopping;
@@ -70,8 +74,39 @@ static void click_mouse(struct filter *f) {
     write_events(f->click, events, 2);
     if (!f->quiet) puts("TAP CLICK ALLOW");
 }
-/* Frame contains only forwarded events, followed by SYN_REPORT when nonempty. */
+static void drag_button(struct filter *f, int down) {
+    int was_down = f->dragging || (f->buttons & 1U);
+    f->dragging = down;
+    int is_down = f->dragging || (f->buttons & 1U);
+    if (was_down != is_down) {
+        struct input_event events[2] = {
+            {.type=EV_KEY, .code=BTN_LEFT, .value=is_down},
+            {.type=EV_SYN, .code=SYN_REPORT}
+        };
+        write_events(f->click, events, 2);
+    }
+}
+/* Physical buttons are routed separately from the touchpad frame. */
 static void process_frame(struct filter *f, struct buffer *frame, double now) {
+    int had_button = f->buttons != 0;
+    size_t kept = 0;
+    for (size_t i = 0; i < frame->n; i++) {
+        struct input_event ev = frame->v[i];
+        if (ev.type == EV_KEY &&
+            (ev.code == BTN_LEFT || ev.code == BTN_RIGHT || ev.code == BTN_MIDDLE)) {
+            unsigned int bit = 1U << (ev.code - BTN_LEFT);
+            had_button = 1;
+            if (ev.value == 1) f->buttons |= bit;
+            else if (ev.value == 0) f->buttons &= ~bit;
+            struct input_event button_frame[2] = {
+                ev, {.type=EV_SYN, .code=SYN_REPORT}
+            };
+            if (!(ev.code == BTN_LEFT && f->dragging))
+                write_events(f->click, button_frame, 2);
+        } else frame->v[kept++] = ev;
+    }
+    frame->n = kept;
+    if (had_button) { f->physical_used = 1; f->tap_armed = 0; }
     int previous_fingers = f->fingers, updated = 0;
     double previous_x = f->x, previous_y = f->y;
     for (size_t i=0; i<frame->n; i++) {
@@ -98,7 +133,14 @@ static void process_frame(struct filter *f, struct buffer *frame, double now) {
     if (started) {
         f->session=1; f->start=now; f->start_x=f->x; f->start_y=f->y;
         f->max_fingers=f->fingers; f->max_distance2=0; f->accepted=0;
-        f->pending.n=0;
+        f->pending.n=0; f->physical_used=had_button;
+        if (f->tap_armed && !had_button && f->fingers == 1 &&
+            now >= f->last_tap && now-f->last_tap <= f->drag_window) {
+            drag_button(f, 1);
+            f->accepted=1;
+            if (!f->quiet) puts("TAP DRAG START");
+        }
+        f->tap_armed=0;
     } else if (f->session) {
         if (f->fingers > f->max_fingers) f->max_fingers=f->fingers;
         if (previous_fingers > f->max_fingers) f->max_fingers=previous_fingers;
@@ -107,6 +149,8 @@ static void process_frame(struct filter *f, struct buffer *frame, double now) {
             if (d > f->max_distance2) f->max_distance2=d;
         }
     }
+    /* Adding a second finger ends the synthetic hold, allowing gestures. */
+    if (f->dragging && f->fingers > 1) drag_button(f, 0);
     if (f->session && !f->accepted) {
         for (size_t i=0; i<frame->n; i++) append(&f->pending, frame->v[i]);
     } else emit(f->out, frame);
@@ -128,9 +172,13 @@ static void process_frame(struct filter *f, struct buffer *frame, double now) {
             int recent=f->has_move && now-f->last_move>=0 && now-f->last_move<=f->click_window;
             int tap=!f->accepted && f->max_fingers==1 && duration<=f->tap_max &&
                     f->max_distance2<=f->tap_slop2;
-            if (tap && recent) click_mouse(f);
+            if (tap && recent && !f->physical_used && !f->buttons) {
+                click_mouse(f);
+                f->last_tap=now; f->tap_armed=1;
+            }
             else if (!f->accepted && !f->quiet)
                 printf("TOUCH DROP: %.0f ms, %.2f mm\n", duration*1000, sqrt(f->max_distance2));
+            if (f->dragging) drag_button(f, 0);
             f->session=0; f->accepted=0; f->max_fingers=0; f->pending.n=0;
         }
     }
@@ -189,6 +237,7 @@ static int clone_device(int dev, struct input_absinfo *absinfo) {
 static int create_mouse(void) {
     int fd=new_uinput();
     check_ioctl(fd,UI_SET_EVBIT,EV_KEY); check_ioctl(fd,UI_SET_KEYBIT,BTN_LEFT);
+    check_ioctl(fd,UI_SET_KEYBIT,BTN_RIGHT); check_ioctl(fd,UI_SET_KEYBIT,BTN_MIDDLE);
     check_ioctl(fd,UI_SET_EVBIT,EV_REL); check_ioctl(fd,UI_SET_RELBIT,REL_X); check_ioctl(fd,UI_SET_RELBIT,REL_Y);
     struct uinput_setup setup={.id={.bustype=BUS_USB},.name="Touchpad Filter Click Mouse"};
     check_ioctl(fd,UI_DEV_SETUP,(unsigned long)&setup); check_ioctl(fd,UI_DEV_CREATE,0);
@@ -199,22 +248,22 @@ static void usage(const char *name) {
            "  --threshold-ms N     default 30\n  --min-move-mm N      default 0.3\n"
            "  --click-window-ms N  default 2000\n  --tap-max-ms N       default 250\n"
            "  --tap-slop-mm N      default 1.5\n  --motion-step-mm N   default 0.1\n"
-           "  --quiet             disable event logging (default)\n  --verbose           enable event logging\n",name);
+           "  --drag-window-ms N   default 300\n  --quiet             disable event logging (default)\n  --verbose           enable event logging\n",name);
 }
 int main(int argc, char **argv) {
     struct filter f={.quiet=1};
-    double values[]={30,0.3,2000,250,1.5,0.1};
+    double values[]={30,0.3,2000,250,1.5,0.1,300};
     const struct option opts[]={
         {"threshold-ms",1,0,0}, {"min-move-mm",1,0,1}, {"click-window-ms",1,0,2},
         {"tap-max-ms",1,0,3}, {"tap-slop-mm",1,0,4}, {"motion-step-mm",1,0,5},
-        {"quiet",0,0,'q'}, {"verbose",0,0,'v'}, {"help",0,0,'h'}, {0,0,0,0}
+        {"drag-window-ms",1,0,6}, {"quiet",0,0,'q'}, {"verbose",0,0,'v'}, {"help",0,0,'h'}, {0,0,0,0}
     };
     int opt;
     while ((opt=getopt_long(argc,argv,"qvh",opts,NULL))!=-1) {
         if (opt=='h') { usage(argv[0]); return 0; }
         if (opt=='q') { f.quiet=1; continue; }
         if (opt=='v') { f.quiet=0; continue; }
-        if (opt<0 || opt>5) return 2;
+        if (opt<0 || opt>6) return 2;
         char *end; errno=0; double v=strtod(optarg,&end);
         if (errno || end==optarg || *end || !isfinite(v) || v<=0 || !isfinite(v*v) || v*v==0) {
             fprintf(stderr,"Thresholds must be finite positive numbers\n"); return 2;
@@ -225,6 +274,7 @@ int main(int argc, char **argv) {
     f.threshold=values[0]/1000; f.min_move2=values[1]*values[1];
     f.click_window=values[2]/1000; f.tap_max=values[3]/1000;
     f.tap_slop2=values[4]*values[4]; f.step2=values[5]*values[5];
+    f.drag_window=values[6]/1000;
     int dev=open(argv[optind],O_RDONLY|O_CLOEXEC);
     if (dev<0) die("open input device");
     unsigned long absbits[WORDS(ABS_CNT)]={0}, keys[WORDS(KEY_CNT)]={0}, active[WORDS(KEY_CNT)]={0};
@@ -274,12 +324,12 @@ int main(int argc, char **argv) {
                 if (frame.n) append(&frame,(struct input_event){.type=EV_SYN,.code=SYN_REPORT});
                 struct timespec ts; if (clock_gettime(CLOCK_MONOTONIC,&ts)<0) die("clock_gettime");
                 process_frame(&f,&frame,(double)ts.tv_sec+(double)ts.tv_nsec/1e9);
-            } else if (ev.type!=EV_SYN && ev.type!=EV_MSC &&
-                       !(ev.type==EV_KEY && (ev.code==BTN_LEFT||ev.code==BTN_RIGHT||ev.code==BTN_MIDDLE))) {
+            } else if (ev.type!=EV_SYN && ev.type!=EV_MSC) {
                 ev.time=(struct timeval){0}; append(&frame,ev);
             }
         }
     }
+    if (f.dragging) drag_button(&f, 0);
     ioctl(dev,EVIOCGRAB,0); ioctl(f.out,UI_DEV_DESTROY); ioctl(f.click,UI_DEV_DESTROY);
     close(f.out); close(f.click); close(dev); free(f.active); free(frame.v); free(f.pending.v);
     return status;
