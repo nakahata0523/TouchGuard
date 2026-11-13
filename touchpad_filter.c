@@ -191,13 +191,13 @@ static int clone_device(int dev, struct input_absinfo *absinfo) {
 static void usage(const char *name) {
     printf("Usage: %s [options] /dev/input/eventN\n"
            "  --threshold-ms N     default 30\n  --min-move-mm N      default 0.3\n"
-           "  --click-window-ms N  default 2000\n  --tap-max-ms N       default 250\n"
+           "  --click-window-ms N  default 1500\n  --tap-max-ms N       default 250\n"
            "  --tap-slop-mm N      default 1.5\n  --motion-step-mm N   default 0.1\n"
            "  --drag-window-ms N   default 300\n  --quiet             disable event logging (default)\n  --verbose           enable event logging\n",name);
 }
 int main(int argc, char **argv) {
     struct filter f={.quiet=1};
-    double values[]={30,0.3,2000,250,1.5,0.1,300};
+    double values[]={30,0.3,1500,250,1.5,0.1,300};
     const struct option opts[]={
         {"threshold-ms",1,0,0}, {"min-move-mm",1,0,1}, {"click-window-ms",1,0,2},
         {"tap-max-ms",1,0,3}, {"tap-slop-mm",1,0,4}, {"motion-step-mm",1,0,5},
