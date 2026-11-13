@@ -64,6 +64,15 @@ static void emit(int fd, struct buffer *b) {
  * apply clickfinger, button areas, tapping and dragging itself. Only an idle
  * single-finger contact is withheld while its intent is unknown. */
 static void process_frame(struct filter *f, struct buffer *frame, double now) {
+    /* evdev omits ABS_MT_SLOT while the selected slot is unchanged. A dropped
+     * contact may have changed that selection only on the physical device.
+     * Make every frame self-contained before buffering or forwarding it. */
+    if (frame->n) {
+        append(frame,(struct input_event){0});
+        memmove(frame->v+1,frame->v,(frame->n-1)*sizeof(*frame->v));
+        frame->v[0]=(struct input_event){.type=EV_ABS,
+            .code=ABS_MT_SLOT,.value=f->slot};
+    }
     int previous_fingers=f->fingers, had_button=f->buttons!=0, updated=0;
     double previous_x=f->x, previous_y=f->y;
     for (size_t i=0; i<frame->n; i++) {

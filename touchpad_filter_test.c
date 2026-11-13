@@ -72,6 +72,30 @@ int main(void) {
     before=size(f.out);
     send_frame(&f,11,-2,30,0,1); send_frame(&f,11.01,-2,30,0,0);
     assert(size(f.out)>before);
+    /* A discarded contact changes the physical slot, but not the output slot.
+     * Subsequent events may omit ABS_MT_SLOT entirely. */
+    struct buffer omitted={0};
+    append(&omitted,(struct input_event){.type=EV_ABS,.code=ABS_MT_SLOT,.value=1});
+    append(&omitted,(struct input_event){.type=EV_ABS,.code=ABS_MT_TRACKING_ID,.value=90});
+    append(&omitted,(struct input_event){.type=EV_SYN,.code=SYN_REPORT});
+    before=size(f.out);
+    process_frame(&f,&omitted,20);
+    append(&omitted,(struct input_event){.type=EV_ABS,.code=ABS_MT_TRACKING_ID,.value=-1});
+    append(&omitted,(struct input_event){.type=EV_SYN,.code=SYN_REPORT});
+    process_frame(&f,&omitted,20.05);
+    assert(size(f.out)==before);
+    append(&omitted,(struct input_event){.type=EV_ABS,.code=ABS_MT_TRACKING_ID,.value=91});
+    append(&omitted,(struct input_event){.type=EV_ABS,.code=ABS_X,.value=30});
+    append(&omitted,(struct input_event){.type=EV_SYN,.code=SYN_REPORT});
+    process_frame(&f,&omitted,21);
+    append(&omitted,(struct input_event){.type=EV_ABS,.code=ABS_X,.value=40});
+    append(&omitted,(struct input_event){.type=EV_SYN,.code=SYN_REPORT});
+    process_frame(&f,&omitted,21.04);
+    assert(f.accepted && size(f.out)>before);
+    struct input_event first;
+    assert(pread(f.out,&first,sizeof(first),before)==sizeof(first));
+    assert(first.type==EV_ABS && first.code==ABS_MT_SLOT && first.value==1);
+    free(omitted.v);
     free(f.pending.v); fclose(output);
     puts("All native forwarding tests passed");
 }
