@@ -36,6 +36,29 @@ int main(void) {
     /* Only idle one-finger taps are discarded. */
     send_frame(&f,1,1,0,0,-1); send_frame(&f,1.05,-1,0,0,-1);
     assert(size(f.out)==0 && !f.session && !f.pending.n);
+    /* Lift-off coordinates must not turn a rejected tap into motion or grant
+     * the next tap a click/drag continuation window. */
+    send_frame(&f,1.2,101,0,0,-1);
+    send_frame(&f,1.25,-1,10,0,-1);
+    assert(size(f.out)==0 && !f.has_move && !f.continuation_until);
+    send_frame(&f,1.3,102,10,0,-1);
+    assert(!f.accepted && size(f.out)==0);
+    send_frame(&f,1.35,-1,10,0,-1);
+    assert(size(f.out)==0 && !f.has_move && !f.continuation_until);
+    /* Firm stationary contact can shift its centroid without an intended move.
+     * The default 1.5 mm gate must reject shifts that passed the old 0.3 mm gate. */
+    f.min_move2=1.5*1.5;
+    send_frame(&f,1.4,103,0,0,-1);
+    send_frame(&f,1.44,-2,10,0,-1);
+    assert(!f.accepted && !f.has_move && size(f.out)==0);
+    send_frame(&f,1.45,-1,10,0,-1);
+    assert(!f.continuation_until && size(f.out)==0);
+    send_frame(&f,1.5,104,0,0,-1);
+    send_frame(&f,1.54,-2,15,0,-1);
+    assert(f.accepted && f.has_move && size(f.out)>0);
+    send_frame(&f,1.56,-1,15,0,-1);
+    assert(ftruncate(f.out,0)==0 && lseek(f.out,0,SEEK_SET)==0);
+    f.has_move=0; f.continuation_until=0; f.min_move2=.09;
     /* Motion releases all pending contact frames; no synthetic button events. */
     send_frame(&f,2,2,0,0,-1); assert(size(f.out)==0);
     send_frame(&f,2.04,-2,3,0,-1);
@@ -83,6 +106,30 @@ int main(void) {
     assert(r[0].code==ABS_MT_SLOT && r[0].value==0 && r[1].code==ABS_MT_TOOL_TYPE && r[1].value==MT_TOOL_PALM);
     assert(r[2].code==ABS_MT_SLOT && r[2].value==1 && r[3].value==MT_TOOL_FINGER);
     assert(r[4].type==EV_SYN && !mt_snapshot[ABS_MT_TOOL_TYPE-ABS_MT_FIRST]);
+    /* A discarded contact changes the physical slot, but not the output slot.
+     * Subsequent events may omit ABS_MT_SLOT entirely. */
+    struct buffer omitted={0};
+    append(&omitted,(struct input_event){.type=EV_ABS,.code=ABS_MT_SLOT,.value=1});
+    append(&omitted,(struct input_event){.type=EV_ABS,.code=ABS_MT_TRACKING_ID,.value=90});
+    append(&omitted,(struct input_event){.type=EV_SYN,.code=SYN_REPORT});
+    before=size(f.out);
+    process_frame(&f,&omitted,20);
+    append(&omitted,(struct input_event){.type=EV_ABS,.code=ABS_MT_TRACKING_ID,.value=-1});
+    append(&omitted,(struct input_event){.type=EV_SYN,.code=SYN_REPORT});
+    process_frame(&f,&omitted,20.05);
+    assert(size(f.out)==before);
+    append(&omitted,(struct input_event){.type=EV_ABS,.code=ABS_MT_TRACKING_ID,.value=91});
+    append(&omitted,(struct input_event){.type=EV_ABS,.code=ABS_X,.value=30});
+    append(&omitted,(struct input_event){.type=EV_SYN,.code=SYN_REPORT});
+    process_frame(&f,&omitted,21);
+    append(&omitted,(struct input_event){.type=EV_ABS,.code=ABS_X,.value=40});
+    append(&omitted,(struct input_event){.type=EV_SYN,.code=SYN_REPORT});
+    process_frame(&f,&omitted,21.04);
+    assert(f.accepted && size(f.out)>before);
+    struct input_event first;
+    assert(pread(f.out,&first,sizeof(first),before)==sizeof(first));
+    assert(first.type==EV_ABS && first.code==ABS_MT_SLOT && first.value==1);
+    free(omitted.v);
     free(f.pending.v); fclose(output);
     puts("All native forwarding tests passed");
 }

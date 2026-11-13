@@ -66,6 +66,15 @@ static void emit(int fd, struct buffer *b) {
  * apply clickfinger, button areas, tapping and dragging itself. Only an idle
  * single-finger contact is withheld while its intent is unknown. */
 static void process_frame(struct filter *f, struct buffer *frame, double now) {
+    /* evdev omits ABS_MT_SLOT while the selected slot is unchanged. A dropped
+     * contact may have changed that selection only on the physical device.
+     * Make every frame self-contained before buffering or forwarding it. */
+    if (frame->n) {
+        append(frame,(struct input_event){0});
+        memmove(frame->v+1,frame->v,(frame->n-1)*sizeof(*frame->v));
+        frame->v[0]=(struct input_event){.type=EV_ABS,
+            .code=ABS_MT_SLOT,.value=f->slot};
+    }
     int previous_fingers=f->fingers, had_button=f->buttons!=0, updated=0;
     double previous_x=f->x, previous_y=f->y;
     for (size_t i=0; i<frame->n; i++) {
@@ -103,13 +112,17 @@ static void process_frame(struct filter *f, struct buffer *frame, double now) {
         int recent=f->has_move && now>=f->last_move && now-f->last_move<=f->click_window;
         int continuation=now<=f->continuation_until;
         f->accepted=recent || continuation;
+        if (f->accepted && !f->quiet)
+            printf("TOUCH ALLOW: %s\n",recent ? "recent motion" : "drag continuation");
         f->continuation_until=0;
     }
     if (f->session) {
         if (had_button) f->physical_used=1;
         if (f->fingers>f->max_fingers) f->max_fingers=f->fingers;
         if (previous_fingers>f->max_fingers) f->max_fingers=previous_fingers;
-        if (f->max_fingers==1) {
+        /* ABS_X/Y in a lift-off frame need not describe a live contact.
+         * Do not let those coordinates authorize this or the next tap. */
+        if (f->fingers && f->max_fingers==1) {
             double d=distance2(f,f->x-f->start_x,f->y-f->start_y);
             if (d>f->max_distance2) f->max_distance2=d;
         }
@@ -119,9 +132,13 @@ static void process_frame(struct filter *f, struct buffer *frame, double now) {
         int bypass=had_button || f->max_fingers>=2;
         if (!f->accepted && (moving || bypass)) {
             f->accepted=1;
+            if (!f->quiet)
+                printf("TOUCH ALLOW: %s, displacement=%.3f mm, duration=%.1f ms, fingers=%d\n",
+                    had_button ? "button event" : f->max_fingers>=2 ? "multiple fingers" : "motion",
+                    sqrt(f->max_distance2),duration*1000,f->max_fingers);
             emit(f->out,&f->pending); f->pending.n=0;
         }
-        if (f->accepted && f->max_fingers==1 && updated &&
+        if (f->accepted && f->fingers && f->max_fingers==1 && updated &&
             duration>=f->threshold && moving &&
             (started || distance2(f,f->x-previous_x,f->y-previous_y)>=f->step2)) {
             f->last_move=now; f->has_move=1;
@@ -134,7 +151,10 @@ static void process_frame(struct filter *f, struct buffer *frame, double now) {
             if (f->accepted && !f->physical_used && duration<=f->tap_max &&
                 (f->max_fingers>=2 || f->max_distance2<=f->tap_slop2))
                 f->continuation_until=now+f->drag_window;
-            if (!f->accepted && !f->quiet) puts("IDLE SINGLE-FINGER TOUCH DROP");
+            if (!f->quiet)
+                printf("TOUCH END: %s, displacement=%.3f mm, duration=%.1f ms, fingers=%d, button=%d\n",
+                    f->accepted ? "forwarded" : "dropped",sqrt(f->max_distance2),
+                    duration*1000,f->max_fingers,f->physical_used);
             f->session=0; f->accepted=0; f->pending.n=0;
         }
     } else emit(f->out,frame);
@@ -221,14 +241,14 @@ static int clone_device(int dev, struct input_absinfo *absinfo) {
 }
 static void usage(const char *name) {
     printf("Usage: %s [options] /dev/input/eventN\n"
-           "  --threshold-ms N     default 30\n  --min-move-mm N      default 0.3\n"
+           "  --threshold-ms N     default 30\n  --min-move-mm N      default 1.5\n"
            "  --click-window-ms N  default 1500\n  --tap-max-ms N       default 250\n"
            "  --tap-slop-mm N      default 1.5\n  --motion-step-mm N   default 0.1\n"
            "  --drag-window-ms N   default 300\n  --quiet             disable event logging (default)\n  --verbose           enable event logging\n",name);
 }
 int main(int argc, char **argv) {
     struct filter f={.quiet=1};
-    double values[]={30,0.3,1500,250,1.5,0.1,300};
+    double values[]={30,1.5,1500,250,1.5,0.1,300};
     const struct option opts[]={
         {"threshold-ms",1,0,0}, {"min-move-mm",1,0,1}, {"click-window-ms",1,0,2},
         {"tap-max-ms",1,0,3}, {"tap-slop-mm",1,0,4}, {"motion-step-mm",1,0,5},
