@@ -18,6 +18,8 @@
 #define WORDS(n) (((n) + BITS - 1) / BITS)
 #define HAS(a,n) (((a)[(n)/BITS] >> ((n)%BITS)) & 1UL)
 #define MAX_BUFFER_EVENTS 1048576U
+#define ABS_MT_FIRST ABS_MT_TOUCH_MAJOR
+#define ABS_MT_LAST ABS_MT_TOOL_Y
 struct buffer { struct input_event *v; size_t n, cap; };
 struct filter {
     int out, slot, slot_min, slot_count, fingers;
@@ -143,6 +145,35 @@ static int check_ioctl(int fd, unsigned long request, unsigned long arg) {
     if (r<0) die("ioctl");
     return r;
 }
+/* libinput keeps the per-slot state it saw before EVIOCGRAB, but the kernel only
+ * reports changes. Without restoring it, e.g. a stale MT_TOOL_PALM in slot 0
+ * makes libinput ignore one finger after the filter stops. */
+static int32_t *mt_snapshot[ABS_MT_LAST-ABS_MT_FIRST+1];
+static void save_mt(int dev, const unsigned long *absbits, int slots) {
+    for (unsigned int c=ABS_MT_FIRST;c<=ABS_MT_LAST;c++) {
+        if (c==ABS_MT_TRACKING_ID || !HAS(absbits,c)) continue;
+        int32_t *v=calloc((size_t)slots+1,sizeof(*v));
+        if (!v) die("calloc");
+        v[0]=(int32_t)c;
+        check_ioctl(dev,EVIOCGMTSLOTS(((size_t)slots+1)*sizeof(*v)),(unsigned long)v);
+        mt_snapshot[c-ABS_MT_FIRST]=v;
+    }
+}
+/* Injected while grabbed, so only the kernel state changes; nothing reaches libinput. */
+static void restore_mt(int dev, int slot_min, int slots) {
+    struct buffer b={0};
+    for (unsigned int c=ABS_MT_FIRST;c<=ABS_MT_LAST;c++) {
+        int32_t *v=mt_snapshot[c-ABS_MT_FIRST];
+        if (!v) continue;
+        for (int i=0;i<slots;i++) {
+            append(&b,(struct input_event){.type=EV_ABS,.code=ABS_MT_SLOT,.value=slot_min+i});
+            append(&b,(struct input_event){.type=EV_ABS,.code=(unsigned short)c,.value=v[i+1]});
+        }
+        free(v); mt_snapshot[c-ABS_MT_FIRST]=NULL;
+    }
+    append(&b,(struct input_event){.type=EV_SYN,.code=SYN_REPORT});
+    write_events(dev,b.v,b.n); free(b.v);
+}
 static int new_uinput(void) {
     int fd=open("/dev/uinput", O_WRONLY|O_CLOEXEC);
     if (fd<0) die("open /dev/uinput");
@@ -220,7 +251,7 @@ int main(int argc, char **argv) {
     f.click_window=values[2]/1000; f.tap_max=values[3]/1000;
     f.tap_slop2=values[4]*values[4]; f.step2=values[5]*values[5];
     f.drag_window=values[6]/1000;
-    int dev=open(argv[optind],O_RDONLY|O_CLOEXEC);
+    int dev=open(argv[optind],O_RDWR|O_CLOEXEC);
     if (dev<0) die("open input device");
     unsigned long absbits[WORDS(ABS_CNT)]={0}, keys[WORDS(KEY_CNT)]={0}, active[WORDS(KEY_CNT)]={0};
     check_ioctl(dev,EVIOCGBIT(EV_ABS,sizeof(absbits)),(unsigned long)absbits);
@@ -251,6 +282,7 @@ int main(int argc, char **argv) {
     for (int i=1;i<=slots;i++) if (tracking[i]>=0) touching=1;
     free(tracking);
     if (touching) { fprintf(stderr,"Lift fingers before starting\n"); return 1; }
+    save_mt(dev,absbits,f.slot_count);
     setvbuf(stdout,NULL,_IOLBF,0);
     if (!f.quiet) puts("Touchpad filter started");
     struct buffer frame={0};
@@ -274,6 +306,7 @@ int main(int argc, char **argv) {
             }
         }
     }
+    restore_mt(dev,f.slot_min,f.slot_count);
     ioctl(dev,EVIOCGRAB,0); ioctl(f.out,UI_DEV_DESTROY);
     close(f.out); close(dev); free(f.active); free(frame.v); free(f.pending.v);
     return status;

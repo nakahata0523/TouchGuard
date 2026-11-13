@@ -72,6 +72,17 @@ int main(void) {
     before=size(f.out);
     send_frame(&f,11,-2,30,0,1); send_frame(&f,11.01,-2,30,0,0);
     assert(size(f.out)>before);
+    /* Exit restores the grab-time per-slot state, e.g. a palm tool type. */
+    int32_t tool[3]={ABS_MT_TOOL_TYPE,MT_TOOL_PALM,MT_TOOL_FINGER};
+    mt_snapshot[ABS_MT_TOOL_TYPE-ABS_MT_FIRST]=malloc(sizeof(tool));
+    memcpy(mt_snapshot[ABS_MT_TOOL_TYPE-ABS_MT_FIRST],tool,sizeof(tool));
+    before=size(f.out); restore_mt(f.out,0,2);
+    struct input_event r[5];
+    assert(size(f.out)-before==(off_t)sizeof(r));
+    assert(pread(f.out,r,sizeof(r),before)==(ssize_t)sizeof(r));
+    assert(r[0].code==ABS_MT_SLOT && r[0].value==0 && r[1].code==ABS_MT_TOOL_TYPE && r[1].value==MT_TOOL_PALM);
+    assert(r[2].code==ABS_MT_SLOT && r[2].value==1 && r[3].value==MT_TOOL_FINGER);
+    assert(r[4].type==EV_SYN && !mt_snapshot[ABS_MT_TOOL_TYPE-ABS_MT_FIRST]);
     free(f.pending.v); fclose(output);
     puts("All native forwarding tests passed");
 }
